@@ -13,7 +13,7 @@ class Router:
 
     def __init__(self, asn, connections):
         print("Router at AS %s starting up" % asn)
-        print(self.are_adjacent("192.168.2.0/23", "192.168.1.0/24"))
+        print(self.are_adjacent("192.168.1.0/24", "192.168.2.0/24"))
         self.asn = asn
         self.forwarding_table = {}
         for relationship in connections:
@@ -68,7 +68,7 @@ class Router:
         Updates the forwarding table given an update massage.
         """
         # Save a copy of the message for later
-        self.cashe_messages.appendleft(message)
+        self.cashe_messages.append(message)
         
         # Check if the message destination is this router
         if message["dst"] != self.our_addr(message["src"]):
@@ -130,13 +130,13 @@ class Router:
                     self.send_update(neighbor, update_massage)
             return
     
-    def update_rebuild(self, table, message):
+    def update_rebuild(self, message):
         """
         Updates the forwarding table given an update massage. For use when the forwarding table is being rebuilt.
         """  
         # Check if the message destination is this router
         if message["dst"] != self.our_addr(message["src"]):
-            return table
+            return
         
         # Check if the network is already in the forwarding table
         source = message["src"]
@@ -149,8 +149,8 @@ class Router:
         
         look_up = self.to_cidr(network, netmask)
         
-        if look_up in table:
-            table[look_up].append({
+        if look_up in self.forwarding_table:
+            self.forwarding_table[look_up].append({
                 "origin": origin,
                 "localpref": localpref,
                 "network": network,
@@ -162,6 +162,7 @@ class Router:
         
         # Add an entry to the forwarding table 
         else:
+            # Potentially aggregate routes
             table_entry = [{ "origin": origin,
                              "localpref": localpref,
                              "network": network,
@@ -170,25 +171,25 @@ class Router:
                              "peer": source,
                              "selfOrigin": self_origin}]
             
-            table[look_up] = table_entry
+            self.forwarding_table[look_up] = table_entry
             
-        return table
+        return
     
-    def withdraw_rebuild(self, table, message):
+    def withdraw_rebuild(self, message):
         """
         Helper function for withdraw to rebuild the forwarding table.
-        """        
+        """
         for msg_body in message["msg"]:
             network = msg_body["network"]
             netmask = msg_body["netmask"]
             look_up = self.to_cidr(network, netmask)
             
-            if look_up in table:
-                    # Use a list comprehension to filter out the entry instead of removing it in-place
-                    table[look_up] = [entry for entry in table[look_up] 
-                                    if not (entry["network"] == network and entry["netmask"] == netmask)]
+            if look_up in self.forwarding_table:
+                for entry in self.forwarding_table[look_up]:
+                    if entry["network"] == network and entry["netmask"] == netmask:
+                        self.forwarding_table[look_up].remove(entry)
         
-        return table
+        return
         
         
     def are_adjacent(self, cidr1, cidr2):
@@ -196,36 +197,16 @@ class Router:
         Check if two CIDR networks are adjacent.
         """
         try:
-            # Extract the network addresses
-            network1 = ipaddress.IPv4Network(cidr1, strict=False)
-            network2 = ipaddress.IPv4Network(cidr2, strict=False)
+            network1 = ipaddress.ip_network(cidr1, strict=False)
+            network2 = ipaddress.ip_network(cidr2, strict=False)
 
-            # Get the last usable IP of the first network and the first usable IP of the second
-            last_ip_network1 = network1.broadcast_address
-            first_ip_network2 = network2.network_address
-
-            # Check if the last IP of network1 + 1 equals the first IP of network2
-            if last_ip_network1 + 1 == first_ip_network2:
-                return True
-
-            # Also check the reverse, in case the networks are given in the opposite order
-            last_ip_network2 = network2.broadcast_address
-            first_ip_network1 = network1.network_address
-
-            if last_ip_network2 + 1 == first_ip_network1:
-                return True
-
-            # Additionally check for cases where networks with different prefix lengths can be adjacent
-            if abs(int(last_ip_network1) - int(first_ip_network2)) == 1:
-                return True
-            if abs(int(last_ip_network2) - int(first_ip_network1)) == 1:
-                return True
-
-            return False
-
+            # Check if the networks are adjacent
+            return (int(network1.broadcast_address) + 1 == int(network2.network_address)) or \
+                (int(network2.broadcast_address) + 1 == int(network1.network_address))
+                    
         except ValueError as e:
             raise ValueError("Invalid CIDR notation.") from e
-                    
+                
     def aggregate_forwarding_table(self, entries):
         """
         Aggregates forwarding table entries of a given network.
@@ -251,8 +232,7 @@ class Router:
                     entry1['ASPath'] == entry2['ASPath'] and
                     entry1['origin'] == entry2['origin'] and
                     entry1['selfOrigin'] == entry2['selfOrigin'] and
-                    net1.supernet(new_prefix=net1.prefixlen - 1) == net2.supernet(new_prefix=net2.prefixlen - 1) and
-                    net1.prefixlen == net2.prefixlen)
+                    )
 
         for entry in entries[1:]:
             # Check if the current entry can be aggregated with the next one
@@ -261,7 +241,6 @@ class Router:
                 new_supernet = current_network.supernet(new_prefix=current_network.prefixlen - 1)
                 current['network'] = str(new_supernet.network_address)
                 current['netmask'] = str(new_supernet.netmask)
-                print("here1")
             else:
                 # If they can't be aggregated add the current to the list and move on to the next
                 aggregated.append(current)
@@ -279,6 +258,8 @@ class Router:
         new_CIDR = ""
         for CIDR, value in self.forwarding_table.items():
             if self.are_adjacent(CIDR, new_network):
+                print(CIDR)
+                print(new_network)
                 new_CIDR = self.combine_cidrs(CIDR, new_network)
                 new_entry = value + table_entry
                 new_table[new_CIDR] = self.aggregate_forwarding_table(new_entry)
@@ -301,18 +282,19 @@ class Router:
         """
         Combine two adjacent CIDR blocks into a single larger block.
         """
+        # Convert to network objects
         network1 = ipaddress.IPv4Network(cidr1, strict=False)
         network2 = ipaddress.IPv4Network(cidr2, strict=False)
         
-        
+        # Ensure network1 is the smaller network, and network2 is the next network
         if int(network1.network_address) > int(network2.network_address):
             network1, network2 = network2, network1
 
-        
+        # Check if the two networks are adjacent
         if int(network1.broadcast_address) + 1 == int(network2.network_address):
-            new_prefix = min(network1.prefixlen, network2.prefixlen) - 1
-            new_network = ipaddress.IPv4Network((int(network1.network_address) & int(network2.network_address), new_prefix), strict=False)
-            return str(new_network)
+            # Calculate the combined network
+            new_prefix = network1.prefixlen - 1
+            return f"{network1.network_address}/{new_prefix}"
         
         raise ValueError("The provided CIDR blocks are not adjacent.")
         
@@ -328,7 +310,10 @@ class Router:
     def withdraw(self, message):
         """
         Recieves a withdraw message and removes the corresponding entry from the forwarding table.
-        """        
+        """
+        # Saves the message in cashe
+        self.cashe_messages.append(message)
+        
         # Revome the entry from the forwarding table
         source = message["src"]
         
@@ -341,39 +326,25 @@ class Router:
                 for entry in self.forwarding_table[look_up]:
                     if entry["network"] == network and entry["netmask"] == netmask:
                         self.forwarding_table[look_up].remove(entry)
-                        if self.forwarding_table[look_up] == []:
-                            del self.forwarding_table[look_up]
             else:
-                print("BEFORE REBUILD")
-                print(self.forwarding_table)
                 # Rebuild the forwarding table without aggregation
-                table = {}
+                self.forwarding_table = {}
+                
                 for message in self.cashe_messages:
-                    print("MESSAGE")
-                    print(message)
                     if message["type"] == "update":
-                        self.update_rebuild(table, message)
+                        self.update_rebuild(message)
                     elif message["type"] == "withdraw":
-                        self.withdraw_rebuild(table, message)
+                        self.withdraw_rebuild(message)
                     else:
                         raise Exception("Unknown message type")
-                    print("AFTER MESSAGE")
-                    print(table)
                     
-                if look_up in table:
-                    table[look_up] = [entry for entry in table[look_up] 
-                                    if not (entry["network"] == network and entry["netmask"] == netmask)]
-                    
-                print("BEFOR AGREGATE")
-                print(table)   
-                self.forwarding_table = table
+                if look_up in self.forwarding_table:
+                    for entry in self.forwarding_table[look_up]:
+                        if entry["network"] == network and entry["netmask"] == netmask:
+                            self.forwarding_table[look_up].remove(entry)
+                            
                 while self.agregate():
-                    print("agregating")
-                print("AFTER REBUILD")
-                print(self.forwarding_table)
-                
-        # Saves the message in cashe
-        self.cashe_messages.appendleft(message)
+                    pass
                     
         # Possibly send copies of the withdraw to neighboring routers
         if self.relations[source] == "cust":
@@ -424,9 +395,7 @@ class Router:
         
         for entry in self.forwarding_table[longest_prefix]:
             entries.append(entry)
-            
-        print("ENTRIES: ", entries)
-            
+        print("Entries: ", entries)
         # Router does not have a route to the destination network return a "no route" message
         if len(entries) == 0:
             self.send_no_route(source)
@@ -501,7 +470,7 @@ class Router:
         """
         Sends a "no route" message to a neighboring router.
         """
-        if network in self.sockets:
+        if network != None:
             self.send(network, json.dumps({ "type": "no_route", 
                                             "src": self.our_addr(network), 
                                             "dst": network, 
