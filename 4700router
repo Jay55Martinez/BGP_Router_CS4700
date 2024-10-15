@@ -232,7 +232,8 @@ class Router:
                     entry1['ASPath'] == entry2['ASPath'] and
                     entry1['origin'] == entry2['origin'] and
                     entry1['selfOrigin'] == entry2['selfOrigin'] and
-                    )
+                    net1.supernet(new_prefix=net1.prefixlen - 1) == net2.supernet(new_prefix=net2.prefixlen - 1) and
+                    net1.prefixlen == net2.prefixlen)
 
         for entry in entries[1:]:
             # Check if the current entry can be aggregated with the next one
