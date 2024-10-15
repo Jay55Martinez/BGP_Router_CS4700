@@ -1,0 +1,3 @@
+# empty makefile
+null:
+    @:

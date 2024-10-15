@@ -1,24 +1,28 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, time, json, select, struct, sys, math
+import argparse, socket, time, json, select, struct, sys, math, ipaddress
+from collections import deque
 
 class Router:
-
+    
+    cashe_messages = deque()
     relations = {}
     sockets = {}
     ports = {}
+    forwarding_table = {}
 
     def __init__(self, asn, connections):
         print("Router at AS %s starting up" % asn)
+        print(self.are_adjacent("192.168.2.0/23", "192.168.1.0/24"))
         self.asn = asn
+        self.forwarding_table = {}
         for relationship in connections:
             port, neighbor, relation = relationship.split("-")
-
             self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sockets[neighbor].bind(('localhost', 0))
             self.ports[neighbor] = int(port)
             self.relations[neighbor] = relation
-            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))       
 
     def our_addr(self, dst):
         quads = list(int(qdn) for qdn in dst.split('.'))
@@ -29,8 +33,10 @@ class Router:
         self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
 
     def run(self):
+        print("running")
         while True:
             socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            # this will not block
             for conn in socks:
                 k, addr = conn.recvfrom(65535)
                 srcif = None
@@ -41,12 +47,537 @@ class Router:
                 msg = k.decode('utf-8')
 
                 print("Received message '%s' from %s" % (msg, srcif))
+                
+                # Parse the message
+                msg = json.loads(k.decode('utf-8'))
+                
+                if msg["type"] == "update":
+                    self.update(msg)
+                elif msg["type"] == "data":
+                    self.recieve_data(msg)
+                elif msg["type"] == "dump":
+                    self.dump(msg)
+                elif msg["type"] == "withdraw":
+                    self.withdraw(msg)
+                else:
+                    raise Exception("Unknown message type")
         return
+    
+    def update(self, message):
+        """
+        Updates the forwarding table given an update massage.
+        """
+        # Save a copy of the message for later
+        self.cashe_messages.appendleft(message)
+        
+        # Check if the message destination is this router
+        if message["dst"] != self.our_addr(message["src"]):
+            src_network = self.get_peer_from_table(message["src"])
+            self.send_no_route(src_network)
+            return
+        
+        # Check if the network is already in the forwarding table
+        source = message["src"]
+        network = message["msg"]["network"]
+        netmask = message["msg"]["netmask"]
+        localpref = message["msg"]["localpref"]
+        as_path = message["msg"]["ASPath"]
+        origin = message["msg"]["origin"]
+        self_origin = message["msg"]["selfOrigin"]
+        
+        look_up = self.to_cidr(network, netmask)
+        
+        if look_up in self.forwarding_table:
+            self.forwarding_table[look_up].append({
+                "origin": origin,
+                "localpref": localpref,
+                "network": network,
+                "ASPath": as_path,
+                "netmask": netmask,
+                "peer": source,
+                "selfOrigin": self_origin
+            })
+        
+        # Add an entry to the forwarding table 
+        else:
+            # Potentially aggregate routes
+            table_entry = [{ "origin": origin,
+                             "localpref": localpref,
+                             "network": network,
+                             "ASPath": as_path,
+                             "netmask": netmask,
+                             "peer": source,
+                             "selfOrigin": self_origin}]
+            
+            if not self.aggregate_routes(look_up, table_entry):
+                self.forwarding_table[look_up] = table_entry
+            else:
+                while self.agregate():
+                    pass
+        
+        # Potentially send copies of the announcement to neighboring routers
+        new_as_path = [self.asn] + message["msg"]["ASPath"]
+        update_massage = {'netmask': netmask, 'ASPath': new_as_path, 'network': network}
+        
+        if self.relations[source] == "cust":
+            for neighbor in self.sockets:
+                if neighbor != source:
+                    self.send_update(neighbor, update_massage)
+            return
+        elif self.relations[source] == "peer" or self.relations[source] == "prov":
+            for neighbor in self.sockets:
+                if self.relations[neighbor] == "cust":
+                    self.send_update(neighbor, update_massage)
+            return
+    
+    def update_rebuild(self, table, message):
+        """
+        Updates the forwarding table given an update massage. For use when the forwarding table is being rebuilt.
+        """  
+        # Check if the message destination is this router
+        if message["dst"] != self.our_addr(message["src"]):
+            return table
+        
+        # Check if the network is already in the forwarding table
+        source = message["src"]
+        network = message["msg"]["network"]
+        netmask = message["msg"]["netmask"]
+        localpref = message["msg"]["localpref"]
+        as_path = message["msg"]["ASPath"]
+        origin = message["msg"]["origin"]
+        self_origin = message["msg"]["selfOrigin"]
+        
+        look_up = self.to_cidr(network, netmask)
+        
+        if look_up in table:
+            table[look_up].append({
+                "origin": origin,
+                "localpref": localpref,
+                "network": network,
+                "ASPath": as_path,
+                "netmask": netmask,
+                "peer": source,
+                "selfOrigin": self_origin
+            })
+        
+        # Add an entry to the forwarding table 
+        else:
+            table_entry = [{ "origin": origin,
+                             "localpref": localpref,
+                             "network": network,
+                             "ASPath": as_path,
+                             "netmask": netmask,
+                             "peer": source,
+                             "selfOrigin": self_origin}]
+            
+            table[look_up] = table_entry
+            
+        return table
+    
+    def withdraw_rebuild(self, table, message):
+        """
+        Helper function for withdraw to rebuild the forwarding table.
+        """        
+        for msg_body in message["msg"]:
+            network = msg_body["network"]
+            netmask = msg_body["netmask"]
+            look_up = self.to_cidr(network, netmask)
+            
+            if look_up in table:
+                    # Use a list comprehension to filter out the entry instead of removing it in-place
+                    table[look_up] = [entry for entry in table[look_up] 
+                                    if not (entry["network"] == network and entry["netmask"] == netmask)]
+        
+        return table
+        
+        
+    def are_adjacent(self, cidr1, cidr2):
+        """
+        Check if two CIDR networks are adjacent.
+        """
+        try:
+            # Extract the network addresses
+            network1 = ipaddress.IPv4Network(cidr1, strict=False)
+            network2 = ipaddress.IPv4Network(cidr2, strict=False)
+
+            # Get the last usable IP of the first network and the first usable IP of the second
+            last_ip_network1 = network1.broadcast_address
+            first_ip_network2 = network2.network_address
+
+            # Check if the last IP of network1 + 1 equals the first IP of network2
+            if last_ip_network1 + 1 == first_ip_network2:
+                return True
+
+            # Also check the reverse, in case the networks are given in the opposite order
+            last_ip_network2 = network2.broadcast_address
+            first_ip_network1 = network1.network_address
+
+            if last_ip_network2 + 1 == first_ip_network1:
+                return True
+
+            # Additionally check for cases where networks with different prefix lengths can be adjacent
+            if abs(int(last_ip_network1) - int(first_ip_network2)) == 1:
+                return True
+            if abs(int(last_ip_network2) - int(first_ip_network1)) == 1:
+                return True
+
+            return False
+
+        except ValueError as e:
+            raise ValueError("Invalid CIDR notation.") from e
+                    
+    def aggregate_forwarding_table(self, entries):
+        """
+        Aggregates forwarding table entries of a given network.
+        """
+        if len(entries) <= 1:
+            return []
+
+        # Sort the entries by network and netmask to ensure they are processed in order
+        entries = sorted(entries, key=lambda x: (x['network'], x['netmask']))
+
+        aggregated = []
+        current = entries[0]
+
+        def can_aggregate(entry1, entry2):
+            """
+            Check if two forwarding table entries can be aggregated.
+            """
+            net1 = ipaddress.IPv4Network(f"{entry1['network']}/{entry1['netmask']}", strict=False)
+            net2 = ipaddress.IPv4Network(f"{entry2['network']}/{entry2['netmask']}", strict=False)
+
+            return (entry1['peer'] == entry2['peer'] and
+                    entry1['localpref'] == entry2['localpref'] and
+                    entry1['ASPath'] == entry2['ASPath'] and
+                    entry1['origin'] == entry2['origin'] and
+                    entry1['selfOrigin'] == entry2['selfOrigin'] and
+                    net1.supernet(new_prefix=net1.prefixlen - 1) == net2.supernet(new_prefix=net2.prefixlen - 1) and
+                    net1.prefixlen == net2.prefixlen)
+
+        for entry in entries[1:]:
+            # Check if the current entry can be aggregated with the next one
+            if can_aggregate(current, entry):
+                current_network = ipaddress.IPv4Network(f"{current['network']}/{current['netmask']}", strict=False)
+                new_supernet = current_network.supernet(new_prefix=current_network.prefixlen - 1)
+                current['network'] = str(new_supernet.network_address)
+                current['netmask'] = str(new_supernet.netmask)
+                print("here1")
+            else:
+                # If they can't be aggregated add the current to the list and move on to the next
+                aggregated.append(current)
+                current = entry
+
+        aggregated.append(current)
+        
+        return aggregated
+        
+    def aggregate_routes(self, new_network, table_entry):
+        """
+        Aggregates routes in the forwarding table.
+        """
+        new_table = {}
+        new_CIDR = ""
+        for CIDR, value in self.forwarding_table.items():
+            if self.are_adjacent(CIDR, new_network):
+                new_CIDR = self.combine_cidrs(CIDR, new_network)
+                new_entry = value + table_entry
+                new_table[new_CIDR] = self.aggregate_forwarding_table(new_entry)
+            else:
+                new_table[CIDR] = value
+        
+        if new_table != self.forwarding_table:
+            new_table[new_CIDR]
+            self.forwarding_table = new_table
+            return True
+        return False
+    
+    def agregate(self):
+        agregated = False
+        for CIDR, value in self.forwarding_table.items():
+            agregated = agregated or self.aggregate_routes(CIDR, value)
+        return agregated
+    
+    def combine_cidrs(self, cidr1, cidr2):
+        """
+        Combine two adjacent CIDR blocks into a single larger block.
+        """
+        network1 = ipaddress.IPv4Network(cidr1, strict=False)
+        network2 = ipaddress.IPv4Network(cidr2, strict=False)
+        
+        
+        if int(network1.network_address) > int(network2.network_address):
+            network1, network2 = network2, network1
+
+        
+        if int(network1.broadcast_address) + 1 == int(network2.network_address):
+            new_prefix = min(network1.prefixlen, network2.prefixlen) - 1
+            new_network = ipaddress.IPv4Network((int(network1.network_address) & int(network2.network_address), new_prefix), strict=False)
+            return str(new_network)
+        
+        raise ValueError("The provided CIDR blocks are not adjacent.")
+        
+    def send_update(self, network, message):
+        """
+        Sends an update message to a neighboring router.
+        """
+        self.send(network, json.dumps({ "type": "update", 
+                                        "src": self.our_addr(network), 
+                                        "dst": network, 
+                                        "msg": message }))
+        
+    def withdraw(self, message):
+        """
+        Recieves a withdraw message and removes the corresponding entry from the forwarding table.
+        """        
+        # Revome the entry from the forwarding table
+        source = message["src"]
+        
+        for msg_body in message["msg"]:
+            network = msg_body["network"]
+            netmask = msg_body["netmask"]
+            look_up = self.to_cidr(network, netmask)
+            
+            if look_up in self.forwarding_table:
+                for entry in self.forwarding_table[look_up]:
+                    if entry["network"] == network and entry["netmask"] == netmask:
+                        self.forwarding_table[look_up].remove(entry)
+                        if self.forwarding_table[look_up] == []:
+                            del self.forwarding_table[look_up]
+            else:
+                print("BEFORE REBUILD")
+                print(self.forwarding_table)
+                # Rebuild the forwarding table without aggregation
+                table = {}
+                for message in self.cashe_messages:
+                    print("MESSAGE")
+                    print(message)
+                    if message["type"] == "update":
+                        self.update_rebuild(table, message)
+                    elif message["type"] == "withdraw":
+                        self.withdraw_rebuild(table, message)
+                    else:
+                        raise Exception("Unknown message type")
+                    print("AFTER MESSAGE")
+                    print(table)
+                    
+                if look_up in table:
+                    table[look_up] = [entry for entry in table[look_up] 
+                                    if not (entry["network"] == network and entry["netmask"] == netmask)]
+                    
+                print("BEFOR AGREGATE")
+                print(table)   
+                self.forwarding_table = table
+                while self.agregate():
+                    print("agregating")
+                print("AFTER REBUILD")
+                print(self.forwarding_table)
+                
+        # Saves the message in cashe
+        self.cashe_messages.appendleft(message)
+                    
+        # Possibly send copies of the withdraw to neighboring routers
+        if self.relations[source] == "cust":
+            for neighbor in self.sockets:
+                if neighbor != source:
+                    self.send_revocation(neighbor, message["msg"])
+            return
+        elif self.relations[source] == "peer" or self.relations[source] == "prov":
+            for neighbor in self.sockets:
+                if self.relations[neighbor] == "cust":
+                    self.send_revocation(neighbor, message["msg"])
+            return
+        
+    def send_revocation(self, network, message):
+        """
+        Sends a withdraw message to a neighboring router.
+        """
+        self.send(network, json.dumps({ "type": "withdraw", 
+                                        "src": self.our_addr(network), 
+                                        "dst": network, 
+                                        "msg": message }))
+    
+    def recieve_data(self, message):
+        """
+        Recieves a data message and forwards it to the correct router.
+        """
+        print("Recieved data message")
+        
+        # Figure out which route in the forwarding table is the best to use
+        destination = message["dst"]
+        source = message["src"]
+        entries = []
+        best_entry = None
+        cidrs = []
+        
+        for CIDR, value in self.forwarding_table.items():
+            if self.is_ip_in_cidr(CIDR, destination):
+                cidrs.append(CIDR)
+        
+        print("CIDRS: ", cidrs)
+        # Longest prefix match
+        longest_prefix = cidrs[0]
+        highest_prefix = cidrs[0].split("/")[1]
+        for i in range(1, len(cidrs)):
+            if int(cidrs[i].split("/")[1]) > int(highest_prefix):
+                highest_prefix = cidrs[i].split("/")[1]
+                longest_prefix = cidrs[i]
+        
+        for entry in self.forwarding_table[longest_prefix]:
+            entries.append(entry)
+            
+        print("ENTRIES: ", entries)
+            
+        # Router does not have a route to the destination network return a "no route" message
+        if len(entries) == 0:
+            self.send_no_route(source)
+            return
+        
+        # Forwarding table contains two entries of the same network
+        elif len(entries) > 1: 
+            best_entry = self.select_best(entries)
+            
+        else:
+            best_entry = entries[0]
+        
+        # Forward the data message to the correct router
+        if best_entry != None:            
+            # Forward if the source or destination router is a customer
+            src_network = self.get_peer_from_table(message["src"])
+            dest_network = self.get_peer_from_table(message["dst"])
+            source_relation = ""
+            dest_relation = ""
+            
+            if src_network != None:  
+                source_relation = self.relations.get(src_network, "")
+            if dest_network != None:
+                dest_relation = self.relations.get(dest_network, "")
+    
+            if source_relation == "cust" or dest_relation == "cust":
+                # print("Forwarding Table: ", self.forwarding_table)
+                self.send(best_entry["peer"], json.dumps(message))
+        
+            # Don't forward if the source or dest router is a peer or provider
+            else:
+                no_route = self.get_peer_from_table(source)
+                self.send_no_route(no_route)
+                
+    def select_best(self, entries):
+        """
+        Apply selection criteria when sending data messages.
+        """
+        # Step 1: The highest local preference
+        highest_localpref = max(entry["localpref"] for entry in entries)
+        entries = [entry for entry in entries if entry["localpref"] == highest_localpref]
+        if len(entries) == 1:
+            return entries[0]
+        
+        # Step 2: Self-origin (prefer entries where selfOrigin is True)
+        self_origin_entries = [entry for entry in entries if entry["selfOrigin"]]
+        if self_origin_entries:
+            entries = self_origin_entries
+        if len(entries) == 1:
+            return entries[0]
+        
+        # Step 3: The shortest AS path
+        shortest_as_path = min(len(entry["ASPath"]) for entry in entries)
+        entries = [entry for entry in entries if len(entry["ASPath"]) == shortest_as_path]
+        if len(entries) == 1:
+            return entries[0]
+        
+        # Step 4: Best origin (IGP > EGP > UNK)
+        origin_priority = {"IGP": 1, "EGP": 2, "UNK": 3}
+        best_origin_rank = min(origin_priority.get(entry["origin"], 3) for entry in entries)
+        entries = [entry for entry in entries if origin_priority.get(entry["origin"], 3) == best_origin_rank]
+        if len(entries) == 1:
+            return entries[0]
+        
+        # Step 5: The lowest IP from neighbor router
+        lowest_ip = min(ipaddress.IPv4Address(entry["peer"]) for entry in entries)
+        entries = [entry for entry in entries if ipaddress.IPv4Address(entry["peer"]) == lowest_ip]
+
+        return entries[0] if entries else None
+        
+    def send_no_route(self, network):
+        """
+        Sends a "no route" message to a neighboring router.
+        """
+        if network in self.sockets:
+            self.send(network, json.dumps({ "type": "no_route", 
+                                            "src": self.our_addr(network), 
+                                            "dst": network, 
+                                            "msg": {} }))
+        return
+    
+    def dump(self, message):
+        """
+        Responds with a "table" massage containing the forwarding table.
+        """
+        print("Dumping table")
+        print(self.forwarding_table)
+        # Check if the message destination is this router
+        if message["dst"] != self.our_addr(message["src"]):
+            src_network = self.get_peer_from_table(message["src"])
+            self.send_no_route(src_network)
+            return
+        
+        forwarding_table = []
+        for CIDR, value in self.forwarding_table.items():
+            for entry in value:
+                forwarding_table.append(entry)
+        
+        # Send the forwarding table to the source router
+        self.send(message["src"], json.dumps({ "type": "table", 
+                                            "src": message["dst"], 
+                                            "dst": message["src"], 
+                                            "msg": forwarding_table}))
+
+    def to_cidr(self, network_address, netmask):
+        """
+        Converts a network address and a netmask into CIDR notation.
+        """
+        try:
+            # Validate and convert inputs to IPv4 objects
+            ip_network = ipaddress.IPv4Network(f"{network_address}/{netmask}", strict=False)
+            
+            # Generate the CIDR notation
+            return str(ip_network)
+        
+        except ipaddress.AddressValueError:
+            raise ValueError("Invalid network address or netmask.")
+        except ipaddress.NetmaskValueError:
+            raise ValueError("The provided netmask is not valid or does not correspond to a valid subnet.")
+    
+    def is_ip_in_cidr(self, cidr, ip_address):
+        """
+        Checks if a given IP address is within a specified CIDR network.
+        """
+        try:
+            network = ipaddress.IPv4Network(cidr, strict=False)
+            ip = ipaddress.IPv4Address(ip_address)
+            return ip in network
+        except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, ValueError):
+            raise ValueError("Invalid CIDR notation or IP address.")
+        
+    def get_peer_from_table(self, ip_address):
+        """
+        Returns the peer of a given IP address in the forwarding table.
+        """
+        for CIDR, value in self.forwarding_table.items():
+                if self.is_ip_in_cidr(CIDR, ip_address):
+                    for entry in value:
+                        return entry["peer"]
+        return None
 
 if __name__ == "__main__":
+    debug = False
     parser = argparse.ArgumentParser(description='route packets')
     parser.add_argument('asn', type=int, help="AS number of this router")
     parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
     args = parser.parse_args()
+    
+    if debug:
+        print(args.asn)
+        print(args.connections)
+    
     router = Router(args.asn, args.connections)
     router.run()
