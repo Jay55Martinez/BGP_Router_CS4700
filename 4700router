@@ -13,7 +13,6 @@ class Router:
 
     def __init__(self, asn, connections):
         print("Router at AS %s starting up" % asn)
-        print(self.are_adjacent("192.168.1.0/24", "192.168.2.0/24"))
         self.asn = asn
         self.forwarding_table = {}
         for relationship in connections:
@@ -197,12 +196,65 @@ class Router:
         Check if two CIDR networks are adjacent.
         """
         try:
+            print(cidr1)
+            print(cidr2)
+            
+            if cidr1.split("/")[1] != cidr2.split("/")[1]:
+                return False
+            
             network1 = ipaddress.ip_network(cidr1, strict=False)
             network2 = ipaddress.ip_network(cidr2, strict=False)
-
+            
+            # Convert both IPs to a string of binary 
+            ip_binary1 = ''.join(f'{int(octet):08b}' for octet in network1.network_address.packed)
+            ip_binary2 = ''.join(f'{int(octet):08b}' for octet in network2.network_address.packed)
+            
+            print('.'.join(f'{int(octet):08b}' for octet in network1.network_address.packed))
+            print('.'.join(f'{int(octet):08b}' for octet in network2.network_address.packed))
+            
+            used_1 = 0
+            
+            bit_change_occurred_index = 0
+            for i in range(len(ip_binary1)):
+                if ip_binary1[i] != ip_binary2[i]:
+                    used_1 += 1
+                    bit_change_occurred_index = i + 1
+                    if (32 - bit_change_occurred_index) % 8 != 0:
+                        next_must_be_1 = True
+                if used_1 > 1:
+                    print("False")
+                    return False
+                # next bit is 1 if not in the next byte
+                if used_1 == 1 and i % 8 == 0:
+                    print("False")
+                    return False
+                
+            if bit_change_occurred_index > int(cidr1.split("/")[1]):
+                print("False")
+                return False
+            
             # Check if the networks are adjacent
-            return (int(network1.broadcast_address) + 1 == int(network2.network_address)) or \
-                (int(network2.broadcast_address) + 1 == int(network1.network_address))
+            print(not ip_binary1 == ip_binary2)
+            return not ip_binary1 == ip_binary2
+            """
+             # Ensure both networks have the same prefix length
+            if cidr1.split("/")[1] != cidr2.split("/")[1]:
+                return False
+            
+            network1 = ipaddress.ip_network(cidr1, strict=False)
+            network2 = ipaddress.ip_network(cidr2, strict=False)
+            
+            # Ensure network1 is the lower network
+            if int(network1.network_address) > int(network2.network_address):
+                network1, network2 = network2, network1
+            
+            # Check if the networks are adjacent by comparing their addresses
+            if int(network1.broadcast_address) + 1 == int(network2.network_address):
+                return True
+            
+            # If there's a larger gap, they are not adjacent
+            return False
+            """
                     
         except ValueError as e:
             raise ValueError("Invalid CIDR notation.") from e
@@ -243,7 +295,6 @@ class Router:
                 current['network'] = str(new_supernet.network_address)
                 current['netmask'] = str(new_supernet.netmask)
             else:
-                # If they can't be aggregated add the current to the list and move on to the next
                 aggregated.append(current)
                 current = entry
 
@@ -259,9 +310,10 @@ class Router:
         new_CIDR = ""
         for CIDR, value in self.forwarding_table.items():
             if self.are_adjacent(CIDR, new_network):
-                print(CIDR)
-                print(new_network)
+                # print(CIDR)
+                # print(new_network)
                 new_CIDR = self.combine_cidrs(CIDR, new_network)
+                # print(new_CIDR)
                 new_entry = value + table_entry
                 new_table[new_CIDR] = self.aggregate_forwarding_table(new_entry)
             else:
@@ -372,7 +424,7 @@ class Router:
         """
         Recieves a data message and forwards it to the correct router.
         """
-        print("Recieved data message")
+        # print("Recieved data message")
         
         # Figure out which route in the forwarding table is the best to use
         destination = message["dst"]
@@ -385,7 +437,7 @@ class Router:
             if self.is_ip_in_cidr(CIDR, destination):
                 cidrs.append(CIDR)
         
-        print("CIDRS: ", cidrs)
+        # print("CIDRS: ", cidrs)
         # Longest prefix match
         longest_prefix = cidrs[0]
         highest_prefix = cidrs[0].split("/")[1]
@@ -396,7 +448,7 @@ class Router:
         
         for entry in self.forwarding_table[longest_prefix]:
             entries.append(entry)
-        print("Entries: ", entries)
+        # print("Entries: ", entries)
         # Router does not have a route to the destination network return a "no route" message
         if len(entries) == 0:
             self.send_no_route(source)

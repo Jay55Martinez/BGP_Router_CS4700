@@ -1,0 +1,20 @@
+[{'origin': 'EGP',
+  'localpref': 100,
+  'network': '11.0.0.0',
+  'ASPath': [3],
+  'netmask': '255.0.0.0',
+  'peer': '10.0.0.2',
+  'selfOrigin': True},
+ 
+ {'origin': 'EGP',
+  'localpref': 150,
+  'network': '12.0.0.0',
+  'ASPath': [1, 4],
+  'netmask': '255.0.0.0',
+  'peer': '192.168.0.2',
+  'selfOrigin': False}]
+
+{'192.168.1.0/24': [{'origin': 'EGP', 'localpref': 100, 'network': '192.168.1.0', 'ASPath': [1], 'netmask': '255.255.255.0', 'peer': '192.168.0.2', 'selfOrigin': True}], 
+ '172.169.0.0/16': [{'origin': 'EGP', 'localpref': 100, 'network': '172.169.0.0', 'ASPath': [2], 'netmask': '255.255.0.0', 'peer': '172.168.0.2', 'selfOrigin': True}],
+ '11.0.0.0/8': [{'origin': 'EGP', 'localpref': 100, 'network': '11.0.0.0', 'ASPath': [3], 'netmask': '255.0.0.0', 'peer': '10.0.0.2', 'selfOrigin': True}],
+ '12.0.0.0/8': [{'origin': 'EGP', 'localpref': 150, 'network': '12.0.0.0', 'ASPath': [1, 4], 'netmask': '255.0.0.0', 'peer': '192.168.0.2', 'selfOrigin': False}, {'origin': 'IGP', 'localpref': 150, 'network': '12.0.0.0', 'ASPath': [3, 4], 'netmask': '255.0.0.0', 'peer': '10.0.0.2', 'selfOrigin': False}]}
