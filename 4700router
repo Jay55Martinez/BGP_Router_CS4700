@@ -216,16 +216,13 @@ class Router:
             off_by_1 = 0
             for i in range(0, 4):
                 if ip_binary1[i] != ip_binary2[i]:
-                    if abs(ip_binary1[i] - ip_binary2[i]) == 1:
-                        bin_ip1 = bin(ip_binary1[i])[2:].zfill(8)
-                        bin_ip2 = bin(ip_binary2[i])[2:].zfill(8)
-                        for j in range(0, 8):
-                            if bin_ip1[j] != bin_ip2[j]:
-                                off_by_1 += 1
-                        if i == 3:
-                            print("false")
-                            return False
-                    else:
+                    # if abs(ip_binary1[i] - ip_binary2[i]) == 1:
+                    bin_ip1 = bin(ip_binary1[i])[2:].zfill(8)
+                    bin_ip2 = bin(ip_binary2[i])[2:].zfill(8)
+                    for j in range(0, 8):
+                        if bin_ip1[j] != bin_ip2[j]:
+                            off_by_1 += 1
+                    if i == 3:
                         print("false")
                         return False
                 if off_by_1 > 1:
