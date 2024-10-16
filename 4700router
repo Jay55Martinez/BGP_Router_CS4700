@@ -200,40 +200,37 @@ class Router:
             print(cidr2)
             
             if cidr1.split("/")[1] != cidr2.split("/")[1]:
+                print("false")
                 return False
             
             network1 = ipaddress.ip_network(cidr1, strict=False)
             network2 = ipaddress.ip_network(cidr2, strict=False)
             
             # Convert both IPs to a string of binary 
-            ip_binary1 = ''.join(f'{int(octet):08b}' for octet in network1.network_address.packed)
-            ip_binary2 = ''.join(f'{int(octet):08b}' for octet in network2.network_address.packed)
+            ip_binary1 = [int(octet) for octet in network1.network_address.packed]
+            ip_binary2 = [int(octet) for octet in network2.network_address.packed]
             
-            print('.'.join(f'{int(octet):08b}' for octet in network1.network_address.packed))
-            print('.'.join(f'{int(octet):08b}' for octet in network2.network_address.packed))
+            # print('.'.join(f'{int(octet)}' for octet in network1.network_address.packed))
+            # print('.'.join(f'{int(octet)}' for octet in network2.network_address.packed))
             
-            used_1 = 0
-            
-            bit_change_occurred_index = 0
-            for i in range(len(ip_binary1)):
+            off_by_1 = 0
+            for i in range(0, 4):
                 if ip_binary1[i] != ip_binary2[i]:
-                    used_1 += 1
-                    bit_change_occurred_index = i + 1
-                    if (32 - bit_change_occurred_index) % 8 != 0:
-                        next_must_be_1 = True
-                if used_1 > 1:
-                    print("False")
+                    if abs(ip_binary1[i] - ip_binary2[i]) == 1:
+                        bin_ip1 = bin(ip_binary1[i])[2:].zfill(8)
+                        bin_ip2 = bin(ip_binary2[i])[2:].zfill(8)
+                        for j in range(0, 8):
+                            if bin_ip1[j] != bin_ip2[j]:
+                                off_by_1 += 1
+                        if i == 3:
+                            print("false")
+                            return False
+                    else:
+                        print("false")
+                        return False
+                if off_by_1 > 1:
+                    print("false")
                     return False
-                # next bit is 1 if not in the next byte
-                if used_1 == 1 and i % 8 == 0:
-                    print("False")
-                    return False
-                
-            if bit_change_occurred_index > int(cidr1.split("/")[1]):
-                print("False")
-                return False
-            
-            # Check if the networks are adjacent
             print(not ip_binary1 == ip_binary2)
             return not ip_binary1 == ip_binary2
             """
